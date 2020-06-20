@@ -5,6 +5,7 @@ from jesse import exceptions
 from .interface import CandleExchange
 import pandas as pd
 import time
+from parse import parse
 
 
 class Kraken(CandleExchange):
@@ -14,58 +15,68 @@ class Kraken(CandleExchange):
     """
 
     def __init__(self):
-        # kraken sends as many trades as we wish, although, 
-        # to be on the safe side we will process only 1000 at a time
-        super().__init__('Kraken', 1000, 6)
+        super().__init__('Kraken', 5000, 6)
         self.endpoint = 'https://api.kraken.com/0/public/Trades'
 
     def init_backup_exchange(self):
         self.backup_exchange = None
 
     def get_starting_time(self, symbol):
-        payload = {
-            'pair': symbol,
-            'since': 000,
-        }
+        data = self._request(symbol, 000)
+        return data[0][2] * 1000
 
+    def _request(self, symbol, start):
+        time.sleep(self.sleep_time)
+        payload = {'pair': symbol, 'since': start}
         response = requests.get(self.endpoint, params=payload)
         self._handle_errors(response)
-
-        data = response.json()
-        candlesDF = self._tradeconversion(data, symbol, limit=self.count)
-        return candlesDF["timestamp"][0].value
+        rspJson = response.json()
+        return rspJson["result"][self._topair(symbol, rspJson["result"].keys())]
 
     def fetch(self, symbol, start_timestamp):
         df = self._fetchDF(symbol, start_timestamp)
+        if df is None or df.empty:
+            return []
         return df.to_dict(orient="records")
 
-    def _fetchDF(self, symbol, start_timestamp):
-        payload = {
-            'pair': symbol,
-            'since': start_timestamp * 10**6,
-        }
+    def _fetchDF(self, symbol, start_timestampEpoch):
+        now = pd.Timestamp.now() - pd.Timedelta("1day")
+        start_timestamp = pd.to_datetime(start_timestampEpoch, unit="ms")
+        if start_timestamp > now:
+            return None
+        end_timestamp_1 = start_timestamp + pd.Timedelta("{}min".format(self.count))
+        if end_timestamp_1 > now:
+            end_timestamp_1 = now
+        # print("\n_fetchDF", start_timestamp, "->", end_timestamp_1)
+        data = self._request(symbol, start_timestampEpoch * 10**6)
+        candlesData = self._tradeDataToDF(data)
+        lastTstamp = candlesData.index[-1]
+        while end_timestamp_1 > lastTstamp:
+            nextTstamp = lastTstamp - pd.Timedelta("1s")  # going one sec, again, to play on safe side
+            nextTstampEpoch = (nextTstamp - pd.Timestamp("1970-01-01")) // pd.Timedelta("1ns")
+            # print("nextTstamp", nextTstamp)
+            # print("candlesDataLen", len(candlesData.index))
+            data = self._request(symbol, nextTstampEpoch)
+            nextCandlesData = self._tradeDataToDF(data)
+            # print("\nintersection length", len(nextCandlesData.index.intersection(candlesData.index)))
+            nextCandlesData.drop(candlesData.index, inplace=True, errors="ignore")
+            candlesData = candlesData.append(nextCandlesData, sort=True)
+            lastTstamp = candlesData.index[-1]
+        return self._tradeconversion(candlesData, symbol)
 
-        response = requests.get(self.endpoint, params=payload)
-        self._handle_errors(response)
-        data = response.json()["result"][self._topair(symbol)]
-        candlesDF = self._tradeconversion(data, symbol, limit=self.count)
-        while len(candlesDF.index) < self.count:
-            time.sleep(self.sleep_time)
-            nextTstamp = (candlesDF.index[-1] - pd.Timestamp("1970-01-01")) // pd.Timedelta("1ns")
-            payload["since"] = nextTstamp
-            response = requests.get(self.endpoint, params=payload)
-            self._handle_errors(response)
-            data = response.json()["result"][self._topair(symbol)]
-            nextCandlesDF = self._tradeconversion(data, symbol, limit=self.count)
-            nextCandlesDF.drop(candlesDF.index, inplace=True, errors="ignore")
-            candlesDF = candlesDF.append(nextCandlesDF, sort=True)
-        return candlesDF
+    def _topair(self, symbol, possibleKeys):
+        for key in possibleKeys:
+            if key == symbol:
+                return key
+            prsd = parse("X{}Z{}", key)
+            if prsd is None:
+                continue
+            if prsd[0] == symbol[:len(prsd[0])] and prsd[1] == symbol[len(prsd[0]):]:
+                return key
 
-    def _topair(self, symbol):
         return "X{}Z{}".format(symbol[:3], symbol[3:]).upper()
 
-    def _tradeconversion(self, data, symbol, limit=-1):
-        # if no limit given, we discard the last candle anyway
+    def _tradeDataToDF(self, data):
         trades = []
         volumes = []
         tstamps = []
@@ -73,16 +84,20 @@ class Kraken(CandleExchange):
             trades.append(float(trade[0]))
             volumes.append(float(trade[1]))
             tstamps.append(pd.to_datetime(trade[2], unit="s"))
-        tradeSeries = pd.Series(data=trades, index=tstamps)
-        volumeSeries = pd.Series(data=volumes, index=tstamps)
+        tradeSeries = pd.Series(data=trades, index=tstamps, name="trade")
+        volumeSeries = pd.Series(data=volumes, index=tstamps, name="volume")
+        return tradeSeries.to_frame().join(volumeSeries.to_frame()).sort_index(inplace=False)
+
+    def _tradeconversion(self, dataDF, symbol):
+        # always discard the last candle anyway
         grouper = pd.Grouper(freq="1Min", base=0)
-        vols = volumeSeries.groupby(grouper).sum()
-        trds = tradeSeries.groupby(grouper).ohlc()
+        vols = dataDF["volume"].groupby(grouper).sum()
+        trds = dataDF["trade"].groupby(grouper).ohlc()
         candls = trds
         candls.loc[:, "volume"] = vols
         # always throw away the last candle
         candls = candls[0:-1]
-        candls = candls[0:limit]
+        # print("\n", candls.index[0], candls.index[-1], len(dataDF.index), "->", len(candls.index))
         candls = candls.fillna(method="ffill")
         candls.loc[:, "id"] = [jh.generate_unique_id() for idx in range(len(candls.index))]
         candls.loc[:, "symbol"] = symbol
