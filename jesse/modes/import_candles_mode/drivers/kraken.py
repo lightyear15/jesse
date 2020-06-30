@@ -47,18 +47,14 @@ class Kraken(CandleExchange):
         end_timestamp_1 = start_timestamp + pd.Timedelta("{}min".format(self.count))
         if end_timestamp_1 > now:
             end_timestamp_1 = now
-        # print("\n_fetchDF", start_timestamp, "->", end_timestamp_1)
         data = self._request(symbol, start_timestampEpoch * 10**6)
         candlesData = self._tradeDataToDF(data)
         lastTstamp = candlesData.index[-1]
         while end_timestamp_1 > lastTstamp:
             nextTstamp = lastTstamp - pd.Timedelta("1s")  # going one sec, again, to play on safe side
             nextTstampEpoch = (nextTstamp - pd.Timestamp("1970-01-01")) // pd.Timedelta("1ns")
-            # print("nextTstamp", nextTstamp)
-            # print("candlesDataLen", len(candlesData.index))
             data = self._request(symbol, nextTstampEpoch)
             nextCandlesData = self._tradeDataToDF(data)
-            # print("\nintersection length", len(nextCandlesData.index.intersection(candlesData.index)))
             nextCandlesData.drop(candlesData.index, inplace=True, errors="ignore")
             candlesData = candlesData.append(nextCandlesData, sort=True)
             lastTstamp = candlesData.index[-1]
@@ -97,7 +93,6 @@ class Kraken(CandleExchange):
         candls.loc[:, "volume"] = vols
         # always throw away the last candle
         candls = candls[0:-1]
-        # print("\n", candls.index[0], candls.index[-1], len(dataDF.index), "->", len(candls.index))
         candls = candls.fillna(method="ffill")
         candls.loc[:, "id"] = [jh.generate_unique_id() for idx in range(len(candls.index))]
         candls.loc[:, "symbol"] = symbol
